@@ -1,58 +1,90 @@
 """
 Medical Lab Report Extraction API.
 
-A FastAPI application that accepts medical lab reports as PDF or image filescurl -X POST "http://localhost:8000/scan-report" `
-  -H "accept: application/json" `
-  -F "file=@D:\LABREPOEXT\LabRep.pdf"
+A FastAPI application that accepts medical lab reports as PDF or image files
 and extracts structured information including doctor name, lab name, date,
 and test names.
-
-This API is designed to work with both physical lab reports captured via
-phone camera (images) and digital PDF reports.
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import logging
-from typing import Optional
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 
 # Import custom modules
 from ocr.image_ocr import extract_text_from_image
 from ocr.pdf_reader import extract_text_from_pdf
 from parser.report_parser import LabReportParser
 from models.response_model import LabReportResponse
+from services.llm_refiner import refine_with_llm
 
 
-# Configure logging
+# ---------------- ENV LOADING ----------------
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+for _env_file in (".env", ".env.local", ".env.example"):
+    _env_path = _PROJECT_ROOT / _env_file
+    if _env_path.exists():
+        load_dotenv(dotenv_path=_env_path, override=False)
+
+
+# ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI application
+
+# ---------------- FASTAPI INIT ----------------
 app = FastAPI(
     title="Medical Lab Report Extraction API",
     description="API for extracting structured information from medical lab reports",
     version="1.0.0"
 )
 
-# Add CORS middleware for Flutter frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify actual frontend URLs
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ---------------- HELPERS ----------------
+def calculate_confidence(data: dict) -> int:
+    score = 0
+    if data.get("doctor_name"):
+        score += 25
+    if data.get("lab_name"):
+        score += 25
+    if data.get("report_date"):
+        score += 25
+    if data.get("test_names"):
+        score += 25
+    return score
+
+
+def should_refine_with_llm(parsed_data: dict, mode: str) -> bool:
+    mode = (mode or "always").strip().lower()
+    if mode == "always":
+        return True
+
+    critical_fields = ("patient_name", "doctor_name", "lab_name", "report_date")
+    for field in critical_fields:
+        value = str(parsed_data.get(field, "")).strip().lower()
+        if not value:
+            return True
+
+        if field == "lab_name" and (len(value) > 90 or value.startswith("notes:")):
+            return True
+
+    return False
+
+
+# ---------------- ROUTES ----------------
 @app.get("/")
 async def read_root():
-    """
-    Health check endpoint.
-    
-    Returns:
-        dict: API status and version information
-    """
     return {
         "message": "Medical Lab Report Extraction API",
         "version": "1.0.0",
@@ -60,115 +92,119 @@ async def read_root():
     }
 
 
-@app.post("/scan-report", response_model=LabReportResponse)
-async def scan_report(file: UploadFile = File(...)) -> LabReportResponse:
-    """
-    Main endpoint to extract information from a lab report.
-    
-    Accepts either a PDF file or an image (JPG/PNG) of a lab report.
-    Extracts text and parses it to return structured JSON response.
-    
-    Args:
-        file (UploadFile): The uploaded file (PDF or image)
-        
-    Returns:
-        LabReportResponse: Structured extracted information
-        
-    Raises:
-        HTTPException: If file type is not supported or processing fails
-    """
+@app.post("/scan-report")
+async def scan_report(file: UploadFile = File(...)):
     try:
-        # Validate file type
         filename = file.filename.lower()
-        
+
+        # ---------- OCR ----------
         if filename.endswith('.pdf'):
-            # Process PDF file
             logger.info(f"Processing PDF file: {filename}")
             extracted_text = await extract_text_from_pdf(file)
-            
+
         elif filename.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif')):
-            # Process image file
             logger.info(f"Processing image file: {filename}")
             extracted_text = await extract_text_from_image(file)
-            
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported file type: {filename}. Please upload a PDF or image (JPG, PNG, BMP, GIF)."
-            )
-        
-        # Check if text was extracted
-        if not extracted_text or extracted_text.strip() == "":
-            raise HTTPException(
-                status_code=400,
-                detail="Could not extract text from the uploaded file. Please ensure the file is clear and readable."
-            )
-        
-        logger.info("Text extraction successful. Starting parsing...")
-        
-        # Parse extracted text
-        parser = LabReportParser(extracted_text)
-        parsed_data = parser.parse_report()
-        
-        logger.info(f"Parsing complete. Extracted data: {parsed_data}")
-        
-        # Create response model
-        response = LabReportResponse(**parsed_data)
-        
-        return response
-        
-    except HTTPException:
-        raise
-    except ValueError as e:
-        logger.error(f"Processing error: {str(e)}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Error processing file: {str(e)}"
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="An unexpected error occurred while processing the file."
-        )
 
-
-@app.post("/scan-report-debug")
-async def scan_report_debug(file: UploadFile = File(...)):
-    """
-    Debug endpoint that returns both extracted text and parsed data.
-    
-    Useful for troubleshooting and improving the parser.
-    
-    Args:
-        file (UploadFile): The uploaded file (PDF or image)
-        
-    Returns:
-        dict: Contains extracted_text and parsed_data
-    """
-    try:
-        filename = file.filename.lower()
-        
-        if filename.endswith('.pdf'):
-            extracted_text = await extract_text_from_pdf(file)
-        elif filename.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif')):
-            extracted_text = await extract_text_from_image(file)
         else:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unsupported file type: {filename}"
             )
-        
+
+        if not extracted_text or extracted_text.strip() == "":
+            raise HTTPException(
+                status_code=400,
+                detail="No text extracted from file"
+            )
+
+        logger.info("Text extraction successful")
+
+        # ---------- PARSER ----------
         parser = LabReportParser(extracted_text)
         parsed_data = parser.parse_report()
-        
+        logger.info(f"Parsed data: {parsed_data}")
+
+        # ---------- LLM REFINEMENT ----------
+        llm_used = False
+        refined_fields = []
+        refinement_mode = os.getenv("LLM_REFINEMENT_MODE", "always").strip().lower()
+
+        try:
+            if should_refine_with_llm(parsed_data, refinement_mode):
+                refined_data = await refine_with_llm(extracted_text, parsed_data)
+            else:
+                logger.info("Skipping LLM refinement: mode=%s and parser quality gate passed.", refinement_mode)
+                refined_data = parsed_data
+
+            if isinstance(refined_data, dict):
+                refined_fields = [
+                    key for key in parsed_data.keys()
+                    if refined_data.get(key) != parsed_data.get(key)
+                ]
+                llm_used = len(refined_fields) > 0
+            else:
+                refined_data = parsed_data
+
+        except Exception as e:
+            logger.warning(f"LLM failed, fallback used: {str(e)}")
+            refined_data = parsed_data
+
+        logger.info(f"Final data after refinement: {refined_data}")
+
+        # ---------- CONFIDENCE ----------
+        confidence_score = calculate_confidence(refined_data)
+
+        # ---------- RESPONSE ----------
+        response = LabReportResponse(**refined_data)
+        response_dict = response.model_dump()
+
+        # Add extra metadata (safe)
+        response_dict["llm_used"] = llm_used
+        response_dict["refinement_mode"] = refinement_mode
+        response_dict["refined_fields"] = refined_fields
+        response_dict["confidence_score"] = confidence_score
+
+        logger.info(f"Final output: {response_dict}")
+
+        return response_dict
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error"
+        )
+
+
+@app.post("/scan-report-debug")
+async def scan_report_debug(file: UploadFile = File(...)):
+    try:
+        filename = file.filename.lower()
+
+        if filename.endswith('.pdf'):
+            extracted_text = await extract_text_from_pdf(file)
+
+        elif filename.endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif')):
+            extracted_text = await extract_text_from_image(file)
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {filename}"
+            )
+
+        parser = LabReportParser(extracted_text)
+        parsed_data = parser.parse_report()
+
         return {
             "extracted_text": extracted_text,
             "parsed_data": parsed_data
         }
-        
-    except HTTPException:
-        raise
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -176,19 +212,13 @@ async def scan_report_debug(file: UploadFile = File(...)):
         )
 
 
+# ---------------- RUN SERVER ----------------
 if __name__ == "__main__":
     import uvicorn
-    
-    # Run the server
-    # Use: python main.py
-    # Then access the API at: http://localhost:8000
-    # Swagger UI at: http://localhost:8000/docs
-    # ReDoc at: http://localhost:8000/redoc
-    
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
-        log_level="info"
+        reload=True
     )

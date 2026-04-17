@@ -7,11 +7,11 @@ achieve high-accuracy text extraction from phone camera photos and
 scanned lab reports.
 """
 
-import pytesseract
-from PIL import Image, ImageFilter, ImageEnhance, ImageOps
-import numpy as np
 import io
-import math
+
+import numpy as np
+import pytesseract
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 
 # ── Tesseract path (Windows) ──────────────────────────────────────────
@@ -37,14 +37,23 @@ async def extract_text_from_image(file) -> str:
     """
     try:
         content = await file.read()
-        image = Image.open(io.BytesIO(content))
-        image = preprocess_image_for_ocr(image)
+        original = Image.open(io.BytesIO(content))
 
-        # Use best-quality Tesseract config
-        custom_config = r"--oem 3 --psm 6"
-        extracted_text = pytesseract.image_to_string(image, config=custom_config)
+        preprocessed = preprocess_image_for_ocr(original)
+        grayscale = _prepare_grayscale_variant(original)
 
-        return extracted_text
+        # Try multiple page segmentation modes; select best by domain-label score.
+        ocr_candidates = []
+        for variant in (preprocessed, grayscale):
+            for config in (r"--oem 3 --psm 6", r"--oem 3 --psm 11", r"--oem 3 --psm 4"):
+                text = pytesseract.image_to_string(variant, config=config)
+                if text and text.strip():
+                    ocr_candidates.append(text)
+
+        if not ocr_candidates:
+            return ""
+
+        return max(ocr_candidates, key=_score_ocr_text)
 
     except Exception as e:
         raise ValueError(f"Failed to extract text from image: {e}")
@@ -110,6 +119,41 @@ def _try_deskew(image: Image.Image) -> Image.Image:
     except Exception:
         pass  # OSD can fail on low-text images; that's fine
     return image
+
+
+def _prepare_grayscale_variant(image: Image.Image) -> Image.Image:
+    """Prepare a softer grayscale variant for forms where hard thresholding loses text."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    max_dim = max(image.size)
+    if max_dim < 2000:
+        scale = 2000 / max_dim
+        image = image.resize((int(image.width * scale), int(image.height * scale)), Image.LANCZOS)
+
+    grey = image.convert("L")
+    grey = _try_deskew(grey)
+    contrast = ImageEnhance.Contrast(grey).enhance(1.6)
+    sharpened = ImageEnhance.Sharpness(contrast).enhance(1.8)
+    return ImageOps.expand(sharpened, border=30, fill=255)
+
+
+def _score_ocr_text(text: str) -> int:
+    """Heuristic score that rewards medically relevant field labels and denser extraction."""
+    low = text.lower()
+    labels = [
+        "name", "gender", "age", "ref", "lab", "entry date", "print date",
+        "haematology", "hematology", "platelet", "rbc", "wbc", "hemoglobin",
+    ]
+
+    score = 0
+    for label in labels:
+        if label in low:
+            score += 8
+
+    score += min(len(text) // 200, 20)
+    score += min(text.count("\n"), 40) // 2
+    return score
 
 
 def _adaptive_threshold(

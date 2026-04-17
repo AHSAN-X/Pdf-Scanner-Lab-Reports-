@@ -80,5 +80,14 @@ HTTPS_ONLY = os.getenv("HTTPS_ONLY", "False").lower() == "true"
 SENTRY_DSN = os.getenv("SENTRY_DSN", None)  # For error tracking
 PROMETHEUS_METRICS = os.getenv("PROMETHEUS_METRICS", "False").lower() == "true"
 
+# LLM Refinement
+LLM_API_BASE_URL = os.getenv("LLM_API_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", 30))
+LLM_REFINEMENT_MODE = os.getenv("LLM_REFINEMENT_MODE", "smart")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "")
+
 # Debug
 DEBUG = os.getenv("DEBUG", "False").lower() == "true"
